@@ -17,6 +17,7 @@ package cli_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,6 +30,7 @@ import (
 	"chainguard.dev/apko/internal/cli"
 	"chainguard.dev/apko/pkg/build"
 	"chainguard.dev/apko/pkg/build/types"
+	"chainguard.dev/apko/pkg/lock"
 	"chainguard.dev/apko/pkg/sbom/generator/spdx"
 )
 
@@ -111,6 +113,119 @@ func TestBuild(t *testing.T) {
 		if diff := cmp.Diff(want, got, transformJSON); diff != "" {
 			t.Errorf("Mismatched SBOMs (-%q +%q):\n%s", goldSbom, sbom, diff)
 		}
+	}
+}
+
+func TestBuildLockfileMissingArchitectures(t *testing.T) {
+	config := build.WithConfig("testdata/apko.yaml", nil)
+	lockPath := filepath.Join(t.TempDir(), "amd64.lock.json")
+	err := cli.LockCmd(t.Context(), lockPath, types.ParseArchitectures([]string{"x86_64"}), withIsolatedDirs(t, config))
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name  string
+		archs []types.Architecture
+		sbom  bool
+		want  string
+	}{
+		{"partially covered", nil, true, "arm64 (regenerate with apko lock --arch=amd64,arm64)"},
+		{"entirely missing", []types.Architecture{"arm64"}, true, "arm64 (regenerate with apko lock --arch=arm64)"},
+		{"multiple missing without SBOM", []types.Architecture{"s390x", "aarch64", "arm64"}, false, "arm64, s390x (regenerate with apko lock --arch=arm64,s390x)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out := t.TempDir()
+			opts := withIsolatedDirs(t, config, build.WithLockFile(lockPath))
+			if tt.sbom {
+				opts = append(opts, build.WithSBOMGenerators(spdx.New()))
+			}
+			err := cli.BuildCmd(t.Context(), "test:latest", out, tt.archs, nil, tt.sbom, t.TempDir(), opts...)
+			require.ErrorContains(t, err, fmt.Sprintf("lockfile %q has no packages for %s", lockPath, tt.want))
+			require.NoFileExists(t, filepath.Join(out, "index.json"))
+		})
+	}
+}
+
+func TestBuildLockfileSubset(t *testing.T) {
+	// The fixture was locked for amd64 and arm64. Both the config and the
+	// installer must select only the APKs from the arm64 repository.
+	l, err := lock.FromFile("testdata/apko.lock.json")
+	require.NoError(t, err)
+	buildSubset := func(path string) string {
+		t.Helper()
+		out := t.TempDir()
+		opts := withIsolatedDirs(t, build.WithConfig("testdata/apko.yaml", nil), build.WithLockFile(path))
+		err := cli.BuildCmd(t.Context(), "test:latest", out, []types.Architecture{"aarch64"}, nil, false, "", opts...)
+		require.NoError(t, err)
+		index, err := layout.ImageIndexFromPath(out)
+		require.NoError(t, err)
+		manifest, err := index.IndexManifest()
+		require.NoError(t, err)
+		require.Len(t, manifest.Manifests, 1)
+		require.NotNil(t, manifest.Manifests[0].Platform)
+		require.Equal(t, "linux/arm64", manifest.Manifests[0].Platform.String())
+		return manifest.Manifests[0].Digest.String()
+	}
+	want := buildSubset("testdata/apko.lock.json")
+	for i := range l.Contents.Packages {
+		p := &l.Contents.Packages[i]
+		p.Architecture = types.ParseArchitecture(p.Architecture).String()
+	}
+	path := filepath.Join(t.TempDir(), "oci.lock.json")
+	require.NoError(t, l.SaveToFile(path))
+	require.Equal(t, want, buildSubset(path))
+
+	for i := range l.Contents.Packages {
+		l.Contents.Packages[i].Architecture = "noarch"
+	}
+	path = filepath.Join(t.TempDir(), "noarch.lock.json")
+	require.NoError(t, l.SaveToFile(path))
+	require.Equal(t, want, buildSubset(path))
+}
+
+func TestBuildWithEmptyLockedPackageList(t *testing.T) {
+	base := &types.BaseImageDescriptor{Image: "testdata/base_image", APKIndex: "testdata/base_image/metadata"}
+	for _, tt := range []struct {
+		name     string
+		base     *types.BaseImageDescriptor
+		packages []string
+	}{
+		{"empty world", nil, nil},
+		{"base provides the requested package", base, []string{"package-x=1.0.0-r0"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			archs := types.ParseArchitectures([]string{"amd64", "arm64"})
+			config := build.WithImageConfiguration(types.ImageConfiguration{Contents: types.ImageContents{
+				Repositories: []string{"./testdata/packages"},
+				Keyring:      []string{"./testdata/melange.rsa.pub"},
+				BaseImage:    tt.base,
+				Packages:     tt.packages,
+			}})
+			path := filepath.Join(t.TempDir(), "empty.lock.json")
+			require.NoError(t, cli.LockCmd(t.Context(), path, archs, withIsolatedDirs(t, config)))
+			l, err := lock.FromFile(path)
+			require.NoError(t, err)
+			require.Empty(t, l.Contents.Packages)
+
+			out := t.TempDir()
+			err = cli.BuildCmd(t.Context(), "test:latest", out, archs, nil, false, "",
+				withIsolatedDirs(t, config, build.WithLockFile(path))...)
+			require.NoError(t, err)
+			index, err := layout.ImageIndexFromPath(out)
+			require.NoError(t, err)
+			manifest, err := index.IndexManifest()
+			require.NoError(t, err)
+			platforms := make([]string, 0, len(manifest.Manifests))
+			for _, m := range manifest.Manifests {
+				require.NotNil(t, m.Platform)
+				platforms = append(platforms, m.Platform.String())
+			}
+			require.ElementsMatch(t, []string{"linux/amd64", "linux/arm64"}, platforms)
+
+			// An extra package absent from the base still needs locked records.
+			err = cli.BuildCmd(t.Context(), "test:latest", t.TempDir(), archs, nil, false, "",
+				withIsolatedDirs(t, config, build.WithLockFile(path), build.WithExtraPackages([]string{"replayout"}))...)
+			require.ErrorContains(t, err, "has no packages for amd64, arm64")
+		})
 	}
 }
 

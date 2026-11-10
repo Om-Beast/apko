@@ -23,8 +23,10 @@ func (p installablePackage) ChecksumString() string { return p.checksum }
 
 func installablePackagesForArch(l lock.Lock, arch types.Architecture) ([]apk.InstallablePackage, error) {
 	pkgs := make([]apk.InstallablePackage, 0, len(l.Contents.Packages))
-	for _, p := range l.Contents.Packages {
-		if p.Architecture != arch.ToAPK() {
+	arch = types.ParseArchitecture(arch.String())
+	for i := range l.Contents.Packages {
+		p := &l.Contents.Packages[i]
+		if p.TargetArchitecture() != arch {
 			continue
 		}
 		if p.Checksum == "" {

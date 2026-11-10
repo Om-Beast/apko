@@ -3,8 +3,9 @@ package lock
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
-	"slices"
+	"path"
 
 	"chainguard.dev/apko/pkg/build/types"
 )
@@ -45,6 +46,7 @@ type LockPkg struct {
 	// Populated since Apko 0.13.
 	Checksum string `json:"checksum"`
 }
+
 type LockPkgRangeAndChecksum struct {
 	Range    string `json:"range"`
 	Checksum string `json:"checksum"`
@@ -85,12 +87,32 @@ func (lock Lock) SaveToFile(lockFile string) error {
 	return os.WriteFile(lockFile, jsonb, os.ModePerm)
 }
 
+// TargetArchitecture returns the platform for which apko locked this APK.
+// A noarch APK keeps its own architecture in the lockfile. Its URL comes
+// from the target's repository at <repository>/<apk-arch>/<package>.apk.
+func (p *LockPkg) TargetArchitecture() types.Architecture {
+	arch := p.Architecture
+	if arch == "noarch" {
+		if u, err := url.Parse(p.URL); err == nil {
+			if dir := path.Dir(u.Path); dir != "." && dir != "/" {
+				arch = path.Base(dir)
+			}
+		}
+	}
+	return types.ParseArchitecture(arch)
+}
+
 // Arch2LockedPackages returns map: for each arch -> list of {package_name}={version} in archs.
 func (lock Lock) Arch2LockedPackages(archs []types.Architecture) map[string][]string {
+	requested := make(map[types.Architecture]bool, len(archs))
+	for _, arch := range archs {
+		requested[types.ParseArchitecture(arch.String())] = true
+	}
 	wantedPackages := make(map[string][]string, len(archs))
-	for _, p := range lock.Contents.Packages {
-		arch := types.ParseArchitecture(p.Architecture)
-		if slices.Contains(archs, arch) {
+	for i := range lock.Contents.Packages {
+		p := &lock.Contents.Packages[i]
+		arch := p.TargetArchitecture()
+		if requested[arch] {
 			wantedPackages[arch.String()] = append(
 				wantedPackages[arch.String()],
 				fmt.Sprintf("%s=%s", p.Name, p.Version),

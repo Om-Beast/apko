@@ -17,6 +17,8 @@ package lock
 import (
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	"chainguard.dev/apko/pkg/build/types"
 )
 
@@ -31,12 +33,18 @@ func TestArch2LockedPackages(t *testing.T) {
 				Name:         "sve",
 				Version:      "2.3.4",
 				Architecture: "aarch64",
+			}, {
+				Name:         "shared",
+				Version:      "1.0",
+				Architecture: "noarch",
+				URL:          "https://example.org/repo/aarch64/shared-1.0.apk",
 			}},
 		},
 	}
 
-	archs := []types.Architecture{types.ParseArchitecture("arm64")}
-	if got, want := len(l.Arch2LockedPackages(archs)), 1; got != want {
-		t.Errorf("wanted %d arch, got %d", want, got)
+	archs := []types.Architecture{"aarch64", "s390x"}
+	want := map[string][]string{"arm64": {"sve=2.3.4", "shared=1.0"}}
+	if diff := cmp.Diff(want, l.Arch2LockedPackages(archs)); diff != "" {
+		t.Errorf("locked packages (-want +got):\n%s", diff)
 	}
 }

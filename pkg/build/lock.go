@@ -89,7 +89,10 @@ func LockImageConfigurationWithPackages(ctx context.Context, ic types.ImageConfi
 				return nil, nil, nil, err
 			}
 		}
-		pls = l.Arch2LockedPackages(input.Archs)
+		pls, err = mc.lockedPackageLists(ctx, l, o.Lockfile)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 	}
 
 	ics := make(map[string]*types.ImageConfiguration, len(mc.Contexts)+1)
@@ -112,6 +115,50 @@ func LockImageConfigurationWithPackages(ctx context.Context, ic types.ImageConfi
 	}
 
 	return ics, missing, resolvedPkgs, nil
+}
+
+func (mc *MultiArch) lockedPackageLists(ctx context.Context, l pkglock.Lock, path string) (map[string][]string, error) {
+	lists := l.Arch2LockedPackages(slices.Collect(maps.Keys(mc.Contexts)))
+	requested, missing := sets.New[string](), sets.New[string]()
+	for arch, bc := range mc.Contexts {
+		name := types.ParseArchitecture(arch.String()).String()
+		requested.Insert(name)
+		if _, ok := lists[name]; ok {
+			continue
+		}
+		if bc.canBuildWithoutLockedPackages(ctx) {
+			lists[name] = nil
+		} else {
+			missing.Insert(name)
+		}
+	}
+	if len(missing) != 0 {
+		return nil, fmt.Errorf("lockfile %q has no packages for %s (regenerate with apko lock --arch=%s)",
+			path, strings.Join(sets.List(missing), ", "), strings.Join(sets.List(requested), ","))
+	}
+	return lists, nil
+}
+
+// ResolveWithBase omits packages already installed in the base image. A lock
+// can therefore have a valid, empty install list even for a nonempty world.
+func (bc *Context) canBuildWithoutLockedPackages(ctx context.Context) bool {
+	if len(bc.ic.Contents.Packages) == 0 && len(bc.o.ExtraPackages) == 0 {
+		return true
+	}
+	if bc.baseimg == nil {
+		return false
+	}
+	installed := bc.baseimg.InstalledPackages()
+	index := apk.APKIndex{Packages: make([]*apk.Package, 0, len(installed))}
+	for _, pkg := range installed {
+		index.Packages = append(index.Packages, &pkg.Package)
+	}
+	repo := apk.Repository{URI: bc.baseimg.APKIndexPath()}
+	base := apk.NewNamedRepositoryWithIndex("", repo.WithIndex(&index))
+	resolver := apk.BuildPkgResolver(ctx, []apk.NamedIndex{base})
+	world := slices.Concat(bc.ic.Contents.Packages, bc.o.ExtraPackages)
+	_, _, err := resolver.GetPackagesWithDependenciesByArch(ctx, world, nil)
+	return err == nil
 }
 
 func resolvePackageList(ctx context.Context, mc *MultiArch) ([]resolved, map[types.Architecture][]*apk.RepositoryPackage, error) {
